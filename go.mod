@@ -7,7 +7,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/config v1.15.13
 	github.com/aws/aws-sdk-go-v2/credentials v1.12.8
 	github.com/aws/aws-sdk-go-v2/service/sqs v1.19.0
-	github.com/docker/docker v20.10.17+incompatible
+	github.com/docker/docker v24.0.7+incompatible
 	github.com/docker/go-connections v0.4.0
 	github.com/stretchr/testify v1.2.2
 )
