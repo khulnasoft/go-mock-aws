@@ -4,13 +4,13 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/container"
+	containertypes "github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/filters"
+	imagetypes "github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/client"
 	"github.com/docker/go-connections/nat"
@@ -21,12 +21,12 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 )
 
-const FixedPort = "4566/tcp"
-const LocalStackImage = "localstack/localstack:1.4"
+const Port = "4566"
+const FixedPort = Port + "/tcp"
+const LocalStackImage = "localstack/localstack:3.0"
 
 type Stack struct {
 	sync.RWMutex
-	initScriptDir       string
 	started             bool
 	reuseExisting       bool
 	containerName       string
@@ -84,8 +84,10 @@ func (s *Stack) stop() error {
 	if !s.started || s.containerID == "" {
 		return nil
 	}
-	timeout := time.Second
-	if err := s.cli.ContainerStop(context.Background(), s.containerID, &timeout); err != nil {
+	timeoutSeconds := 10
+	if err := s.cli.ContainerStop(context.Background(), s.containerID, containertypes.StopOptions{
+		Timeout: &timeoutSeconds,
+	}); err != nil {
 		return err
 	}
 	s.containerID = ""
@@ -122,12 +124,12 @@ func (s *Stack) start() error {
 	}
 
 	resp, err := s.cli.ContainerCreate(s.ctx,
-		&container.Config{
+		&containertypes.Config{
 			Image:        LocalStackImage,
 			Tty:          true,
 			AttachStdout: true,
 			AttachStderr: true,
-		}, &container.HostConfig{
+		}, &containertypes.HostConfig{
 			PortBindings: s.pm,
 			Mounts:       s.getVolumeMounts(),
 			AutoRemove:   true,
@@ -141,7 +143,7 @@ func (s *Stack) start() error {
 
 	s.containerID = resp.ID
 
-	if err := s.cli.ContainerStart(s.ctx, s.containerID, types.ContainerStartOptions{}); err != nil {
+	if err := s.cli.ContainerStart(s.ctx, s.containerID, containertypes.StartOptions{}); err != nil {
 		return err
 	}
 
@@ -149,7 +151,7 @@ func (s *Stack) start() error {
 	if s.waitForInit {
 		for {
 			if s.initTimeout > 0 && time.Since(start) > time.Duration(s.initTimeout)*time.Second {
-				_ = fmt.Errorf("localstack: init timeout exceeded (%d seconds)", s.initTimeout)
+				return fmt.Errorf("localstack: init timeout exceeded (%d seconds)", s.initTimeout)
 			}
 			if s.initComplete() {
 				break
@@ -172,29 +174,37 @@ func (s *Stack) start() error {
 
 func (s *Stack) ensureImage(imageName string) error {
 
-	images, err := s.cli.ImageList(s.ctx, types.ImageListOptions{All: true})
+	f := filters.NewArgs()
+	f.Add("reference", imageName)
+
+	images, err := s.cli.ImageList(s.ctx, imagetypes.ListOptions{
+		Filters: f,
+	})
+
 	if err != nil {
 		return err
 	}
 
 	for _, image := range images {
-		if image.ID == imageName {
-			return nil
+		for _, tag := range image.RepoTags {
+			if tag == imageName {
+				return nil
+			}
 		}
 	}
 
-	resp, err := s.cli.ImagePull(s.ctx, imageName, types.ImagePullOptions{})
+	resp, err := s.cli.ImagePull(s.ctx, imageName, imagetypes.PullOptions{})
 	if err != nil {
 		return err
 	}
 
 	defer func() { _ = resp.Close() }()
-	_, err = io.Copy(ioutil.Discard, resp)
+	_, err = io.Copy(io.Discard, resp)
 	return err
 }
 
 func (s *Stack) initComplete() bool {
-	reader, err := s.cli.ContainerLogs(s.ctx, s.containerID, types.ContainerLogsOptions{
+	reader, err := s.cli.ContainerLogs(s.ctx, s.containerID, containertypes.LogsOptions{
 		ShowStdout: true,
 		Follow:     false,
 	})
@@ -203,14 +213,14 @@ func (s *Stack) initComplete() bool {
 	}
 	defer func() { _ = reader.Close() }()
 
-	logContent, err := ioutil.ReadAll(reader)
+	logContent, err := io.ReadAll(reader)
 	if err != nil {
 		return false
 	}
 
 	logLineCheck := s.initCompleteLogLine
 	if logLineCheck == "" {
-		logLineCheck = "INFO success: infra entered RUNNING state"
+		logLineCheck = "Ready."
 	}
 
 	return strings.Contains(string(logContent), logLineCheck)
@@ -220,26 +230,18 @@ func (s *Stack) getVolumeMounts() []mount.Mount {
 	var mounts []mount.Mount
 	for mountPath, localPath := range s.volumeMounts {
 		mounts = append(mounts, mount.Mount{
-			Type:   mount.TypeBind,
-			Source: localPath,
-			Target: mountPath,
+			Type:     mount.TypeBind,
+			Source:   localPath,
+			Target:   mountPath,
+			ReadOnly: true,
 		})
 	}
+	mounts = append(mounts, mount.Mount{
+		Type:   mount.TypeBind,
+		Source: "/var/run/docker.sock",
+		Target: "/var/run/docker.sock",
+	})
 	return mounts
-}
-
-func (s *Stack) instanceAlreadyRunning() bool {
-	containers, err := s.cli.ContainerList(s.ctx, types.ContainerListOptions{})
-	if err != nil {
-		return false
-	}
-	for _, cont := range containers {
-		if cont.Image == LocalStackImage {
-			s.containerID = cont.ID
-			return true
-		}
-	}
-	return false
 }
 
 func (s *Stack) isFunctional() bool {
